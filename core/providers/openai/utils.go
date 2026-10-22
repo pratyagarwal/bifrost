@@ -302,9 +302,10 @@ func ConvertOpenAIMessagesToBifrostMessages(messages []OpenAIMessage) []schemas.
 // OpenAI wire format, dropping neutral-format fields the OpenAI wire has no
 // carrier for. Over-long tool call IDs are stripped of embedded provider
 // reasoning signatures, and tool messages lose is_error so providers that reject
-// unknown message parameters never see it.
+// unknown message parameters never see it. With developerAsSystem, developer
+// messages are sent as system for models that reject the developer role.
 // The caller's messages are never mutated: shared pointers are cloned before edit.
-func ConvertBifrostMessagesToOpenAIMessages(messages []schemas.ChatMessage) []OpenAIMessage {
+func ConvertBifrostMessagesToOpenAIMessages(messages []schemas.ChatMessage, developerAsSystem bool) []OpenAIMessage {
 	openaiMessages := make([]OpenAIMessage, len(messages))
 	for i, message := range messages {
 		openaiMessages[i] = OpenAIMessage{
@@ -312,6 +313,9 @@ func ConvertBifrostMessagesToOpenAIMessages(messages []schemas.ChatMessage) []Op
 			Role:            message.Role,
 			Content:         message.Content,
 			ChatToolMessage: message.ChatToolMessage,
+		}
+		if developerAsSystem && message.Role == schemas.ChatMessageRoleDeveloper {
+			openaiMessages[i].Role = schemas.ChatMessageRoleSystem
 		}
 		// Strip provider reasoning signatures (e.g. Gemini thoughtSignatures embedded in
 		// call_id as "<baseID>_ts_<sig>") from the tool result's tool_call_id, but only when it
@@ -396,4 +400,74 @@ func toolChoiceAnySupported(provider schemas.ModelProvider, model string) bool {
 	default:
 		return false
 	}
+}
+
+// defaultSupportsDeveloperRole is the name-based fallback for ModelCaps.SupportsDeveloperRole:
+// Qwen on Fireworks rejects role "developer" with "Unexpected message role".
+func defaultSupportsDeveloperRole(provider schemas.ModelProvider, model string) bool {
+	return provider != schemas.Fireworks || !strings.Contains(strings.ToLower(model), "qwen")
+}
+
+// wrapSystemReminder renders system text for a user turn, matching the Anthropic converter's fallback.
+func wrapSystemReminder(text string) string {
+	return "<system-reminder>\n" + text + "\n</system-reminder>\n"
+}
+
+// inlineChatMidConversationSystem rewrites system / developer messages after the leading run as
+// user turns, prefixed with <system-reminder>
+func inlineChatMidConversationSystem(messages []OpenAIMessage) []OpenAIMessage {
+	leading := true
+	for i := range messages {
+		m := &messages[i]
+		isSystem := m.Role == schemas.ChatMessageRoleSystem || m.Role == schemas.ChatMessageRoleDeveloper
+		if leading && isSystem {
+			continue
+		}
+		leading = false
+		if !isSystem || m.Content == nil {
+			continue
+		}
+		content := &schemas.ChatMessageContent{}
+		if m.Content.ContentStr != nil {
+			content.ContentStr = new(wrapSystemReminder(*m.Content.ContentStr))
+		}
+		for _, block := range m.Content.ContentBlocks {
+			if block.Text != nil {
+				block.Text = new(wrapSystemReminder(*block.Text))
+			}
+			content.ContentBlocks = append(content.ContentBlocks, block)
+		}
+		*m = OpenAIMessage{Name: m.Name, Role: schemas.ChatMessageRoleUser, Content: content}
+	}
+	return messages
+}
+
+func inlineResponsesMidConversationSystem(messages []schemas.ResponsesMessage) []schemas.ResponsesMessage {
+	leading := true
+	for i := range messages {
+		m := &messages[i]
+		isSystem := m.Role != nil &&
+			(*m.Role == schemas.ResponsesInputMessageRoleSystem || *m.Role == schemas.ResponsesInputMessageRoleDeveloper) &&
+			(m.Type == nil || *m.Type == schemas.ResponsesMessageTypeMessage)
+		if leading && isSystem {
+			continue
+		}
+		leading = false
+		if !isSystem || m.Content == nil {
+			continue
+		}
+		content := &schemas.ResponsesMessageContent{}
+		if m.Content.ContentStr != nil {
+			content.ContentStr = schemas.Ptr(wrapSystemReminder(*m.Content.ContentStr))
+		}
+		for _, block := range m.Content.ContentBlocks {
+			if block.Text != nil {
+				block.Text = schemas.Ptr(wrapSystemReminder(*block.Text))
+			}
+			content.ContentBlocks = append(content.ContentBlocks, block)
+		}
+		m.Role = schemas.Ptr(schemas.ResponsesInputMessageRoleUser)
+		m.Content = content
+	}
+	return messages
 }

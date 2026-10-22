@@ -27,7 +27,7 @@ func TestToolResultIsErrorStrippedFromOpenAIWire(t *testing.T) {
 		},
 	}
 
-	converted := ConvertBifrostMessagesToOpenAIMessages(messages)
+	converted := ConvertBifrostMessagesToOpenAIMessages(messages, false)
 	if len(converted) != 1 {
 		t.Fatalf("expected 1 converted message, got %d", len(converted))
 	}

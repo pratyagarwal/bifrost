@@ -39,15 +39,18 @@ func ToOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bifros
 		return nil
 	}
 
+	capModel := schemas.ResolveCanonicalModel(ctx, bifrostReq.Model)
+	caps := schemas.ResolveModelCaps(schemas.ResolveBaseProvider(ctx, bifrostReq.Provider), capModel)
+
 	openaiReq := &OpenAIChatRequest{
 		Model:    bifrostReq.Model,
-		Messages: ConvertBifrostMessagesToOpenAIMessages(bifrostReq.Input),
+		Messages: ConvertBifrostMessagesToOpenAIMessages(bifrostReq.Input, !caps.SupportsDeveloperRole(defaultSupportsDeveloperRole(caps.Provider(), capModel))),
 		Provider: bifrostReq.Provider,
 	}
 
-	// Canonical model for capability gating only; wire model (openaiReq.Model) is untouched.
-	capModel := schemas.ResolveCanonicalModel(ctx, bifrostReq.Model)
-	caps := schemas.ResolveModelCaps(bifrostReq.Provider, capModel)
+	if !caps.SupportsMidConversationSystem(true) {
+		openaiReq.Messages = inlineChatMidConversationSystem(openaiReq.Messages)
+	}
 
 	if bifrostReq.Params != nil {
 		openaiReq.ChatParameters = *bifrostReq.Params
