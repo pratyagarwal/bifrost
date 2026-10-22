@@ -73,8 +73,10 @@ export function OpenAIConfigFormFragment({ provider }: OpenAIConfigFormFragmentP
 										<FormLabel>Disable Store</FormLabel>
 										<p className="text-muted-foreground text-xs">
 											With the Responses API, store defaults to true, and when it is on, the generated response is stored for later
-											retrieval via API. OpenAI exposes endpoints to retrieve and delete stored responses, so your response IDs become
-											durable server-side objects instead of one-shot IDs.
+											retrieval via API.{" "}
+											{provider.name === "fireworks"
+												? "Turn off store for fireworks."
+												: "OpenAI exposes endpoints to retrieve and delete stored responses, so your response IDs become durable server-side objects instead of one-shot IDs."}
 										</p>
 									</div>
 									<FormControl>
