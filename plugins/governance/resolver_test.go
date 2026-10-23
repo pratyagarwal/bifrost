@@ -2,10 +2,12 @@ package governance
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
 	bifrost "github.com/maximhq/bifrost/core"
+	"github.com/maximhq/bifrost/core/providers/anthropic"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/configstore"
 	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
@@ -843,6 +845,154 @@ func TestPreLLMHookChecksEveryModelAPassthroughBodyNames(t *testing.T) {
 	_, shortCircuit, err := plugin.PreLLMHook(emptyCtx(), passthrough(schemas.PassthroughRequest, "", mixed))
 	require.NoError(t, err)
 	assert.Nil(t, shortCircuit)
+}
+
+// An advisor tool names a second model that the provider runs and bills within the same request,
+// so that model is held to the key's model restriction just as the request's own model is. Each
+// ingress that can carry the tool is driven: the native Messages body (converted the way the
+// /anthropic/v1/messages route converts it), the neutral Responses tool (/v1/responses and the Go
+// SDK), and an Anthropic passthrough body. A request without the tool is untouched.
+func TestPreLLMHookChecksModelsNamedByServerTools(t *testing.T) {
+	const executor = "claude-haiku-4-5-20251001"
+	const advisor = "claude-opus-4-8"
+	restricted := buildVirtualKeyWithProviders("vk-adv", "sk-bf-adv", "Advisor VK", []configstoreTables.TableVirtualKeyProviderConfig{
+		buildProviderConfig("anthropic", []string{executor}),
+	})
+	permitsBoth := buildVirtualKeyWithProviders("vk-adv", "sk-bf-adv", "Advisor VK", []configstoreTables.TableVirtualKeyProviderConfig{
+		buildProviderConfig("anthropic", []string{executor, advisor}),
+	})
+
+	messages := func(t *testing.T, advisorModel string) *schemas.BifrostRequest {
+		t.Helper()
+		body := `{"model":"anthropic/` + executor + `","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]`
+		if advisorModel != "" {
+			body += `,"tools":[{"type":"advisor_20260301","name":"advisor","model":"` + advisorModel + `"}]`
+		}
+		body += `}`
+		var native anthropic.AnthropicMessageRequest
+		require.NoError(t, json.Unmarshal([]byte(body), &native))
+		converted := native.ToBifrostResponsesRequest(schemas.NewBifrostContext(context.Background(), schemas.NoDeadline))
+		require.NotNil(t, converted)
+		return &schemas.BifrostRequest{RequestType: schemas.ResponsesRequest, ResponsesRequest: converted}
+	}
+	responses := func(t *testing.T, advisorModel string) *schemas.BifrostRequest {
+		t.Helper()
+		req := &schemas.BifrostResponsesRequest{Provider: schemas.Anthropic, Model: executor, Params: &schemas.ResponsesParameters{}}
+		if advisorModel != "" {
+			require.NoError(t, json.Unmarshal([]byte(`[{"type":"advisor","model":"`+advisorModel+`"}]`), &req.Params.Tools))
+		}
+		return &schemas.BifrostRequest{RequestType: schemas.ResponsesStreamRequest, ResponsesRequest: req}
+	}
+	passthrough := func(_ *testing.T, advisorModel string) *schemas.BifrostRequest {
+		body := `{"model":"` + executor + `","max_tokens":1024,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"advisor_20260301","name":"advisor","model":"` + advisorModel + `"}]}`
+		return &schemas.BifrostRequest{RequestType: schemas.PassthroughRequest, PassthroughRequest: &schemas.BifrostPassthroughRequest{
+			Provider: schemas.Anthropic, Model: executor, Method: "POST", Path: "/v1/messages", Body: []byte(body),
+		}}
+	}
+
+	routes := []struct {
+		name  string
+		build func(t *testing.T, advisorModel string) *schemas.BifrostRequest
+	}{
+		{"anthropic messages", messages},
+		{"responses", responses},
+		{"anthropic passthrough", passthrough},
+	}
+	for _, route := range routes {
+		t.Run(route.name+": advisor model outside the key's models is refused", func(t *testing.T) {
+			plugin := newAccessTestPlugin(t, restricted, nil)
+			_, shortCircuit, err := plugin.PreLLMHook(presentCtx("sk-bf-adv"), route.build(t, advisor))
+			require.NoError(t, err)
+			assertShortCircuitDecision(t, DecisionModelBlocked, shortCircuit)
+			assert.Contains(t, shortCircuit.Error.Error.Message, advisor)
+		})
+		t.Run(route.name+": provider-prefixed advisor model is judged on its bare id", func(t *testing.T) {
+			plugin := newAccessTestPlugin(t, restricted, nil)
+			_, shortCircuit, err := plugin.PreLLMHook(presentCtx("sk-bf-adv"), route.build(t, "anthropic/"+advisor))
+			require.NoError(t, err)
+			assertShortCircuitDecision(t, DecisionModelBlocked, shortCircuit)
+		})
+		t.Run(route.name+": advisor model the key permits is allowed", func(t *testing.T) {
+			plugin := newAccessTestPlugin(t, permitsBoth, nil)
+			_, shortCircuit, err := plugin.PreLLMHook(presentCtx("sk-bf-adv"), route.build(t, advisor))
+			require.NoError(t, err)
+			assertShortCircuitDecision(t, DecisionAllow, shortCircuit)
+		})
+		t.Run(route.name+": advisor naming the executor model is allowed", func(t *testing.T) {
+			plugin := newAccessTestPlugin(t, restricted, nil)
+			_, shortCircuit, err := plugin.PreLLMHook(presentCtx("sk-bf-adv"), route.build(t, executor))
+			require.NoError(t, err)
+			assertShortCircuitDecision(t, DecisionAllow, shortCircuit)
+		})
+	}
+	for _, route := range routes[:2] {
+		t.Run(route.name+": no server tool, restricted key", func(t *testing.T) {
+			plugin := newAccessTestPlugin(t, restricted, nil)
+			_, shortCircuit, err := plugin.PreLLMHook(presentCtx("sk-bf-adv"), route.build(t, ""))
+			require.NoError(t, err)
+			assertShortCircuitDecision(t, DecisionAllow, shortCircuit)
+		})
+	}
+}
+
+// An advisor model with a budget or rate limit of its own is refused rather than checked and never
+// charged: the request's usage is charged against the executor model's limits alone.
+func TestPreLLMHookRefusesServerToolModelsWithTheirOwnLimits(t *testing.T) {
+	vk := buildVirtualKeyWithProviders("vk-adv", "sk-bf-adv", "Advisor VK", []configstoreTables.TableVirtualKeyProviderConfig{
+		buildProviderConfig("anthropic", []string{"*"}),
+	})
+	limited := buildRateLimit("rl-opus", 1000, 1000)
+	logger := NewMockLogger()
+	store, err := NewLocalGovernanceStore(context.Background(), logger, nil, &configstore.GovernanceConfig{
+		VirtualKeys:  []configstoreTables.TableVirtualKey{*vk},
+		ModelConfigs: []configstoreTables.TableModelConfig{*buildModelConfig("mc-opus", "claude-opus-4-8", nil, nil, limited)},
+		RateLimits:   []configstoreTables.TableRateLimit{*limited},
+	}, nil, nil)
+	require.NoError(t, err)
+	plugin, err := InitFromStore(context.Background(), &Config{IsVkMandatory: boolPtr(false)}, logger, store, nil, nil, nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, plugin.Cleanup()) })
+
+	req := &schemas.BifrostResponsesRequest{Provider: schemas.Anthropic, Model: "claude-haiku-4-5-20251001", Params: &schemas.ResponsesParameters{}}
+	require.NoError(t, json.Unmarshal([]byte(`[{"type":"advisor","model":"claude-opus-4-8"}]`), &req.Params.Tools))
+	_, shortCircuit, err := plugin.PreLLMHook(presentCtx("sk-bf-adv"), &schemas.BifrostRequest{RequestType: schemas.ResponsesRequest, ResponsesRequest: req})
+	require.NoError(t, err)
+	assertShortCircuitDecision(t, DecisionModelLimitsUnattributable, shortCircuit)
+	assert.Contains(t, shortCircuit.Error.Error.Message, "claude-opus-4-8")
+}
+
+// BenchmarkPreLLMHookServerToolModels measures the governance pre-hook on Responses requests with no
+// tools, with a function tool only (the common case, which must not pay for the server-tool scan),
+// and with an advisor tool naming a second model.
+func BenchmarkPreLLMHookServerToolModels(b *testing.B) {
+	vk := buildVirtualKeyWithProviders("vk-adv", "sk-bf-adv", "Advisor VK", []configstoreTables.TableVirtualKeyProviderConfig{
+		buildProviderConfig("anthropic", []string{"*"}),
+	})
+	plugin := newAccessTestPlugin(b, vk, nil)
+	cases := []struct{ name, tools string }{
+		{"no_tools", ""},
+		{"function_tool", `[{"type":"function","name":"f","parameters":{"type":"object"}}]`},
+		{"advisor_tool", `[{"type":"function","name":"f","parameters":{"type":"object"}},{"type":"advisor","model":"claude-opus-4-8"}]`},
+	}
+	for _, tc := range cases {
+		params := &schemas.ResponsesParameters{}
+		if tc.tools != "" {
+			if err := json.Unmarshal([]byte(tc.tools), &params.Tools); err != nil {
+				b.Fatal(err)
+			}
+		}
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				req := &schemas.BifrostRequest{RequestType: schemas.ResponsesRequest, ResponsesRequest: &schemas.BifrostResponsesRequest{
+					Provider: schemas.Anthropic, Model: "claude-haiku-4-5-20251001", Params: params,
+				}}
+				if _, _, err := plugin.PreLLMHook(presentCtx("sk-bf-adv"), req); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
 }
 
 // TestBudgetResolver_EvaluateVirtualKey_ActiveNoExpiry verifies that a VK
