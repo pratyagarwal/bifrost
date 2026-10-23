@@ -1,12 +1,29 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "child_process";
-import { chmodSync, createWriteStream, existsSync, fsyncSync, mkdirSync, mkdtempSync, rmSync } from "fs";
+import { createHash } from "crypto";
+import {
+	chmodSync,
+	createWriteStream,
+	existsSync,
+	fsyncSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	unlinkSync,
+} from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { Readable } from "stream";
 
 const BASE_URL = "https://downloads.getmaxim.ai";
+const REQUEST_TIMEOUT_MS = 30_000; // checksum fetch
+
+// First release whose binaries ship with a .sha256 file. Older releases were
+// published without one, so a missing checksum is only tolerated below this.
+const CHECKSUM_REQUIRED_SINCE = "v2.3.3";
 
 function isTransportVersionFlag(arg) {
 	const eq = arg.indexOf("=");
@@ -241,6 +258,75 @@ async function downloadBinary(url, dest) {
 	chmodSync(dest, 0o755);
 }
 
+// Parses "v1.2.3" / "v1.2.3-pre" into [major, minor, patch]; null when unparseable.
+function parseCoreVersion(version) {
+	const match = /^v(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?$/.exec(version || "");
+	return match ? match.slice(1, 4).map(Number) : null;
+}
+
+// A checksum is mandatory for unresolved versions ("latest") and for any release
+// at or above CHECKSUM_REQUIRED_SINCE, prereleases of that line included.
+function isChecksumRequired(version) {
+	const current = parseCoreVersion(version);
+	if (!current) {
+		return true;
+	}
+	const since = parseCoreVersion(CHECKSUM_REQUIRED_SINCE);
+	for (let i = 0; i < 3; i++) {
+		if (current[i] !== since[i]) {
+			return current[i] > since[i];
+		}
+	}
+	return true;
+}
+
+function refuseBinary(binaryPath, ...messages) {
+	try {
+		unlinkSync(binaryPath);
+	} catch {
+		// already gone
+	}
+	for (const message of messages) {
+		console.error(message);
+	}
+	process.exit(1);
+}
+
+// Verify the downloaded binary against its published SHA-256 checksum
+async function verifyChecksum(binaryPath, checksumUrl, version) {
+	let res;
+	try {
+		res = await fetch(checksumUrl, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+	} catch (error) {
+		refuseBinary(binaryPath, `❌ Could not fetch checksum file: ${error.message}. Refusing to run an unverified binary.`);
+	}
+
+	if (res.status === 404 && !isChecksumRequired(version)) {
+		console.warn(`⚠️ Release ${version} was published without a checksum file; skipping verification.`);
+		return;
+	}
+	if (!res.ok) {
+		refuseBinary(binaryPath, `❌ Checksum file not available (${res.status}). Refusing to run an unverified binary.`);
+	}
+
+	// Format: "<hash>  <filename>" (shasum output)
+	const expectedHash = (await res.text()).trim().split(/\s+/)[0].toLowerCase();
+	if (!/^[0-9a-f]{64}$/.test(expectedHash)) {
+		refuseBinary(binaryPath, "❌ Could not parse checksum file. Refusing to run an unverified binary.");
+	}
+
+	const actualHash = createHash("sha256").update(readFileSync(binaryPath)).digest("hex");
+	if (actualHash !== expectedHash) {
+		refuseBinary(
+			binaryPath,
+			"❌ Checksum verification failed!",
+			`   Expected: ${expectedHash}`,
+			`   Got:      ${actualHash}`,
+			"   The downloaded binary has been deleted for safety.",
+		);
+	}
+}
+
 // Returns the os cache directory path for storing binaries
 // Linux: $XDG_CACHE_HOME or ~/.cache
 // macOS: ~/Library/Caches
@@ -351,7 +437,21 @@ function formatBytes(bytes) {
 		const binaryPath = join(bifrostBinDir, `${binaryName}-${i}`);
 
 		if (!namedVersionFound || !existsSync(binaryPath)) {
-			await downloadBinary(downloadUrls[i], binaryPath);
+			// Download next to the final path and only move it into place once verified,
+			// so an interrupted or rejected download never lands in the cache.
+			const tempBinaryPath = `${binaryPath}.download-${process.pid}-${Date.now()}`;
+			try {
+				await downloadBinary(downloadUrls[i], tempBinaryPath);
+				await verifyChecksum(tempBinaryPath, `${downloadUrls[i]}.sha256`, urlVersion);
+				renameSync(tempBinaryPath, binaryPath);
+			} catch (err) {
+				try {
+					unlinkSync(tempBinaryPath);
+				} catch {
+					// already gone
+				}
+				throw err;
+			}
 			console.log(`✅ Downloaded binary to ${binaryPath}`);
 
 			// Add a small delay to ensure file is fully written and not busy
