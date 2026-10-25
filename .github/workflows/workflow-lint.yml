@@ -59,3 +59,6 @@ jobs:
 
       - name: Check module path major versions
         run: ./.github/workflows/scripts/module-major.test.sh
+
+      - name: Check test-ref resolver
+        run: ./.github/workflows/scripts/resolve-test-ref.test.sh
